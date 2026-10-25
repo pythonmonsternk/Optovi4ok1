@@ -9,12 +9,13 @@ EMAIL = ""  # Укажите ваш Email от аккаунта optovi4ok.top
 PASSWORD = ""  # Укажите ваш пароль
 
 OUTPUT_DIR = "Готовые_товары_для_Viber"
-TEXTS_DIR = os.path.join(OUTPUT_DIR, "Тексты_описаний")
+# Путь к единому текстовому файлу прямо внутри папки выгрузки
+ALL_TEXTS_FILE = os.path.join(OUTPUT_DIR, "Все_описания.txt")
 
 
 def save_product_to_folder(idx, title, price_str, desc_text, image_urls):
-    """Создает папку для товара с картинками, а текст сохраняет в отдельную общую папку"""
-    # Очищаем название от запрещенных символов для папок/файлов
+    """Создает папку для товара с картинками, а текст дописывает в общий файл"""
+    # Очищаем название от запрещенных символов для папок
     safe_title = re.sub(r'[\\/*?:"<>|]', "", title.strip())
 
     # 1. Папка для картинок товара
@@ -22,15 +23,10 @@ def save_product_to_folder(idx, title, price_str, desc_text, image_urls):
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
 
-    # 2. Папка для всех текстовых файлов
-    if not os.path.exists(TEXTS_DIR):
-        os.makedirs(TEXTS_DIR)
-
-    # Сохраняем текстовое описание в отдельную папку Тексты_описаний
-    text_file_path = os.path.join(TEXTS_DIR, f"Товар_{idx}_{safe_title}.txt")
-    full_text = f"{title.strip()}\n{price_str}\n\n{desc_text}"
-    with open(text_file_path, "w", encoding="utf-8") as f:
-        f.write(full_text)
+    # 2. Дописываем текст в единый общий файл
+    product_block = f"{title.strip()}\n{price_str}\n\n{desc_text}\n\n" + "=" * 40 + "\n\n"
+    with open(ALL_TEXTS_FILE, "a", encoding="utf-8") as f:
+        f.write(product_block)
 
     # 3. Скачиваем все картинки в папку товара
     downloaded_count = 0
@@ -46,12 +42,23 @@ def save_product_to_folder(idx, title, price_str, desc_text, image_urls):
             print(f"Ошибка скачивания фото: {e}")
 
     print(
-        f"[Успешно] Товар #{idx}: папка с фото создана, а текст сохранен в 'Тексты_описаний' (Фотографий: {downloaded_count})")
+        f"[Успешно] Товар #{idx}: папка с фото создана, а текст добавлен в 'Все_описания.txt' (Фотографий: {downloaded_count})")
 
 
 async def main():
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
+
+    # Перед началом работы очищаем старый файл с текстами (если был), чтобы не дублировать
+    if os.path.exists(ALL_TEXTS_FILE):
+        os.remove(ALL_TEXTS_FILE)
+
+    # Запрашиваем у пользователя количество товаров для выгрузки
+    try:
+        target_count = int(input("Сколько всего товаров выгрузить? (например, 20, 40, 60): "))
+    except ValueError:
+        target_count = 20
+        print("Введено не число, по умолчанию будет собрано 20 товаров.")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -74,20 +81,50 @@ async def main():
         else:
             print("--> Уже авторизованы в системе!\n")
 
-        print("--> Переход в каталог...")
+        print("--> Переход в каталог и сбор товаров...")
         await page.goto("https://optovi4ok.top/", wait_until="networkidle")
         await asyncio.sleep(2)
 
-        product_elements = await page.locator(".product-item").all()
         product_links = []
-        for elem in product_elements:
-            href = await elem.get_attribute("href")
-            if href:
-                if not href.startswith("http"):
-                    href = "https://optovi4ok.top/" + href.lstrip("/")
-                product_links.append(href)
+        current_page = 1
 
-        print(f"Найдено товаров: {len(product_links)}\n" + "=" * 50)
+        # Цикл сбора товаров с учетом пагинации
+        while len(product_links) < target_count:
+            print(f"--> Сбор товаров со страницы {current_page}...")
+            product_elements = await page.locator(".product-item").all()
+
+            if not product_elements:
+                print("--> Больше товаров на сайте не найдено.")
+                break
+
+            for elem in product_elements:
+                href = await elem.get_attribute("href")
+                if href:
+                    if not href.startswith("http"):
+                        href = "https://optovi4ok.top/" + href.lstrip("/")
+                    if href not in product_links:
+                        product_links.append(href)
+
+                if len(product_links) >= target_count:
+                    break
+
+            if len(product_links) >= target_count:
+                break
+
+            # Кнопка следующей страницы в OpenCart
+            next_button = page.locator(".pagination a:has-text('>'), .pagination li.active + li a, a.next").first
+            if await next_button.count() > 0:
+                await next_button.click()
+                await page.wait_for_load_state("networkidle")
+                await asyncio.sleep(2)
+                current_page += 1
+            else:
+                print("--> Кнопка следующей страницы не найдена или достигнут конец каталога.")
+                break
+
+        product_links = product_links[:target_count]
+
+        print(f"\nСобрано ссылок на товары: {len(product_links)}\n" + "=" * 50)
 
         for idx, link in enumerate(product_links, 1):
             try:
@@ -98,7 +135,7 @@ async def main():
                 title_elem = item_page.locator("h1").first
                 title_text = await title_elem.inner_text() if await title_elem.count() > 0 else "Товар"
 
-                # Цена и наценка (+35 если > 500, иначе +25)
+                # Цена и наценка
                 body_text = await item_page.inner_text("body")
                 price_match = re.search(r'(\d+)\s*грн', body_text)
 
@@ -131,7 +168,7 @@ async def main():
                         if src_clean not in images:
                             images.append(src_clean)
 
-                # Сохраняем товар (фото в папку товара, текст в общую папку с текстами)
+                # Сохраняем товар (фото в папку, текст в единый файл Все_описания.txt)
                 save_product_to_folder(idx, title_text, final_price_str, desc_text, images)
 
                 await item_page.close()
@@ -140,7 +177,7 @@ async def main():
                 print(f"Ошибка при обработке товара #{idx}: {e}")
                 continue
 
-        print("\n--> Готово! Картинки разложены по папкам товаров, а все тексты собраны в папке 'Тексты_описаний'.")
+        print("\n--> Готово! Картинки разложены по папкам, а все тексты собраны в едином файле 'Все_описания.txt'.")
         await browser.close()
 
 
